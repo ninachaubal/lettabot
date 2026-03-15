@@ -213,7 +213,8 @@ function buildMetadataLines(msg: InboundMessage, options: EnvelopeOptions): stri
     lines.push(`- **Message ID**: ${msg.messageId}`);
   }
 
-  // Sender
+  // User identity
+  lines.push(`- **User ID**: ${msg.channel}_${msg.userId}`);
   if (options.includeSender !== false) {
     lines.push(`- **Sender**: ${formatSender(msg)}`);
   }

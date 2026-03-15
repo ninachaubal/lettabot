@@ -16,7 +16,7 @@ import { formatApiErrorForUser } from './errors.js';
 import { formatToolCallDisplay, formatReasoningDisplay, formatQuestionsForChannel } from './display.js';
 import type { AgentSession } from './interfaces.js';
 import { Store } from './store.js';
-import { getPendingApprovals, rejectApproval, cancelRuns, cancelConversation, recoverOrphanedConversationApproval, getLatestRunError, getAgentModel, updateAgentModel, isRecoverableConversationId, recoverPendingApprovalsForAgent } from '../tools/letta-api.js';
+import { getPendingApprovals, rejectApproval, cancelRuns, cancelConversation, recoverOrphanedConversationApproval, getLatestRunError, getAgentModel, updateAgentModel, isRecoverableConversationId, recoverPendingApprovalsForAgent, createAndAttachBlock, agentHasBlock } from '../tools/letta-api.js';
 import { getAgentSkillExecutableDirs, isVoiceMemoConfigured } from '../skills/loader.js';
 import { formatMessageEnvelope, formatGroupBatchEnvelope, type SessionContextOptions } from './formatter.js';
 import type { GroupBatcher } from './group-batcher.js';
@@ -33,6 +33,7 @@ import { resolveEmoji } from './emoji.js';
 import { SessionManager } from './session-manager.js';
 import { createDisplayPipeline, type DisplayEvent, type CompleteEvent, type ErrorEvent } from './display-pipeline.js';
 import { TurnLogger, TurnAccumulator, generateTurnId, type TurnRecord } from './turn-logger.js';
+import { buildUserBlockLabel, loadUserBlockTemplate } from './memory.js';
 
 
 import { createLogger } from '../logger.js';
@@ -295,6 +296,9 @@ export class LettaBot implements AgentSession {
   // SDK surfaces non-empty result run_ids. Until then, this map mostly stays
   // empty and the streamed/result divergence guard remains the active defense.
   private lastResultRunFingerprints: Map<string, string> = new Map();
+
+  // Per-user memory block tracking: block labels we've already verified/created
+  private knownUserBlocks = new Set<string>();
 
   // AskUserQuestion support: resolves when the next user message arrives.
   // In per-chat mode, keyed by convKey so each chat resolves independently.
@@ -1259,9 +1263,48 @@ export class LettaBot implements AgentSession {
   }
 
   // =========================================================================
+  // Per-user memory block registration
+  // =========================================================================
+
+  /**
+   * Ensure that the Letta agent has a dedicated memory block for this user.
+   * Uses an in-memory cache to avoid redundant API calls after the first check.
+   */
+  private async ensureUserMemoryBlock(msg: InboundMessage): Promise<void> {
+    const label = buildUserBlockLabel(msg.channel, msg.userId);
+
+    // Fast path: already known
+    if (this.knownUserBlocks.has(label)) return;
+
+    const agentId = this.store.agentId;
+    if (!agentId) return;
+
+    // Check if block already exists on the agent
+    if (await agentHasBlock(agentId, label)) {
+      this.knownUserBlocks.add(label);
+      return;
+    }
+
+    // Create new block from template
+    const template = loadUserBlockTemplate(this.config.agentName);
+    const blockId = await createAndAttachBlock(
+      agentId,
+      label,
+      template.value,
+      template.description,
+      template.limit,
+    );
+
+    if (blockId) {
+      this.knownUserBlocks.add(label);
+      log.info(`Created memory block for new user: ${label}`);
+    }
+  }
+
+  // =========================================================================
   // processMessage - User-facing message handling
   // =========================================================================
-  
+
   private async processMessage(msg: InboundMessage, adapter: ChannelAdapter, retried = false): Promise<void> {
     // Track timing and last target
     const debugTiming = !!process.env.LETTABOT_DEBUG_TIMING;
@@ -1269,6 +1312,12 @@ export class LettaBot implements AgentSession {
     const lap = (label: string) => {
       log.debug(`${label}: ${(performance.now() - t0).toFixed(0)}ms`);
     };
+
+    // Ensure per-user memory block exists (fire-and-forget; errors are logged inside)
+    this.ensureUserMemoryBlock(msg).catch((err) => {
+      log.warn(`Failed to ensure user memory block: ${err}`);
+    });
+
     const suppressDelivery = isResponseDeliverySuppressed(msg);
     const prepared = await this.prepareMessageForRun(msg, adapter, suppressDelivery, lap);
     if (!prepared) {

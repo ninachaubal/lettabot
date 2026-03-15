@@ -41,6 +41,7 @@ export class SlackAdapter implements ChannelAdapter {
   private running = false;
   private attachmentsDir?: string;
   private attachmentsMaxBytes?: number;
+  private userProfileCache = new Map<string, string>(); // userId -> displayName
   
   onMessage?: (msg: InboundMessage) => Promise<void>;
   onCommand?: (command: string, chatId?: string, args?: string) => Promise<string | null>;
@@ -165,11 +166,14 @@ export class SlackAdapter implements ChannelAdapter {
             return;
           }
         }
-        
+
+        const displayName = await this.resolveUserName(userId || '');
+
         await this.onMessage({
           channel: 'slack',
           chatId: channelId,
           userId: userId || '',
+          userName: displayName,
           userHandle: userId || '',  // Slack user ID serves as handle
           messageId: message.ts || undefined,
           text: text || '',
@@ -271,11 +275,13 @@ export class SlackAdapter implements ChannelAdapter {
         );
         // app_mention is always in a channel (group)
         const isGroup = !channelId.startsWith('D');
-        
+        const displayName = await this.resolveUserName(userId || '');
+
         await this.onMessage({
           channel: 'slack',
           chatId: channelId,
           userId: userId || '',
+          userName: displayName,
           userHandle: userId || '',  // Slack user ID serves as handle
           messageId: event.ts || undefined,
           text: text || '',
@@ -404,6 +410,30 @@ export class SlackAdapter implements ChannelAdapter {
     // This is a no-op
   }
 
+  /**
+   * Resolve a Slack user ID to a human-readable display name.
+   * Results are cached to avoid redundant API calls.
+   */
+  private async resolveUserName(userId: string): Promise<string> {
+    const cached = this.userProfileCache.get(userId);
+    if (cached !== undefined) return cached;
+
+    try {
+      const result = await this.app!.client.users.info({ user: userId });
+      const displayName =
+        result.user?.profile?.display_name ||
+        result.user?.real_name ||
+        result.user?.name ||
+        userId;
+      this.userProfileCache.set(userId, displayName);
+      return displayName;
+    } catch (error) {
+      log.warn(`Failed to resolve user profile for ${userId}:`, error);
+      this.userProfileCache.set(userId, userId);
+      return userId;
+    }
+  }
+
   private async handleReactionEvent(
     event: SlackReactionEvent,
     action: InboundReaction['action']
@@ -427,11 +457,13 @@ export class SlackAdapter implements ChannelAdapter {
     const isGroup = !channelId.startsWith('D');
     const eventTs = Number(event.event_ts);
     const timestamp = Number.isFinite(eventTs) ? new Date(eventTs * 1000) : new Date();
+    const displayName = await this.resolveUserName(userId);
 
     await this.onMessage?.({
       channel: 'slack',
       chatId: channelId,
       userId,
+      userName: displayName,
       userHandle: userId,
       messageId,
       text: '',
