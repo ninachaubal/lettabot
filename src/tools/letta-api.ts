@@ -968,59 +968,6 @@ export async function recoverOrphanedConversationApproval(
   }
 }
 
-// ============================================================================
-// Memory Block Management
-// ============================================================================
-
-/**
- * Create a memory block and attach it to an agent.
- * Returns the block ID on success, null on failure.
- */
-export async function createAndAttachBlock(
-  agentId: string,
-  label: string,
-  value: string,
-  description?: string,
-  limit?: number,
-): Promise<string | null> {
-  try {
-    const client = getClient();
-    const block = await client.blocks.create({ label, value, description, limit });
-    await client.agents.blocks.attach(block.id, { agent_id: agentId });
-    log.info(`Created and attached memory block: ${label} for agent ${agentId}`);
-    return block.id;
-  } catch (e) {
-    log.error('Failed to create and attach block:', e);
-    return null;
-  }
-}
-
-/**
- * List all memory blocks attached to an agent.
- */
-export async function getAgentMemoryBlocks(agentId: string): Promise<Letta.BlockResponse[]> {
-  try {
-    const client = getClient();
-    const page = await client.agents.blocks.list(agentId);
-    const blocks: Letta.BlockResponse[] = [];
-    for await (const block of page) {
-      blocks.push(block);
-    }
-    return blocks;
-  } catch (e) {
-    log.error('Failed to get agent memory blocks:', e);
-    return [];
-  }
-}
-
-/**
- * Check if an agent has a memory block with the given label.
- */
-export async function agentHasBlock(agentId: string, label: string): Promise<boolean> {
-  const blocks = await getAgentMemoryBlocks(agentId);
-  return blocks.some(block => block.label === label);
-}
-
 export async function disableAllToolApprovals(agentId: string): Promise<number> {
   try {
     const tools = await getAgentTools(agentId);

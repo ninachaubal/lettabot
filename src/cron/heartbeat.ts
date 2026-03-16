@@ -195,12 +195,20 @@ export class HeartbeatService {
     }
     
     const intervalMs = this.config.intervalMinutes * 60 * 1000;
-    
-    log.info(`Starting in SILENT MODE (every ${this.config.intervalMinutes} minutes)`);
-    log.info(`First heartbeat in ${this.config.intervalMinutes} minutes`);
-    
-    // Wait full interval before first heartbeat (don't fire on startup)
-    this.intervalId = setInterval(() => this.runHeartbeat(), intervalMs);
+    // Add up to 20% random jitter to stagger concurrent requests and avoid
+    // token-rate-limit spikes when multiple heartbeats would otherwise fire
+    // at the same instant.
+    const jitterMs = Math.floor(Math.random() * intervalMs * 0.2);
+    const firstFireMs = intervalMs + jitterMs;
+
+    log.info(`Starting in SILENT MODE (every ${this.config.intervalMinutes} minutes, +${Math.round(jitterMs / 1000)}s jitter)`);
+    log.info(`First heartbeat in ${Math.round(firstFireMs / 60000)} minutes`);
+
+    // Wait full interval (+ jitter) before first heartbeat (don't fire on startup)
+    this.intervalId = setTimeout(() => {
+      this.runHeartbeat();
+      this.intervalId = setInterval(() => this.runHeartbeat(), intervalMs);
+    }, firstFireMs);
     
     logEvent('heartbeat_started', {
       intervalMinutes: this.config.intervalMinutes,
@@ -214,7 +222,8 @@ export class HeartbeatService {
    */
   stop(): void {
     if (this.intervalId) {
-      clearInterval(this.intervalId);
+      // Works for both setTimeout and setInterval (NodeJS.Timeout)
+      clearTimeout(this.intervalId);
       this.intervalId = null;
       log.info('Stopped');
     }

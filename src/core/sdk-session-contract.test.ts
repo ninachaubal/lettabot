@@ -1081,7 +1081,7 @@ describe('SDK session contract', () => {
     );
   });
 
-  it('retries sendToAgent once after approval-stuck result error and succeeds', async () => {
+  it('retries sendToAgent once after approval-stuck result error when recovery succeeds', async () => {
     let streamCall = 0;
     const mockSession = {
       initialize: vi.fn(async () => undefined),
@@ -1098,7 +1098,8 @@ describe('SDK session contract', () => {
         })();
       }),
       close: vi.fn(() => undefined),
-      recoverPendingApprovals: vi.fn(async () => ({ recovered: false, unsupported: true, detail: 'mock' })),
+      // SDK recovery succeeds so retry happens
+      recoverPendingApprovals: vi.fn(async () => ({ recovered: true, detail: 'mock' })),
       agentId: 'agent-contract-test',
       conversationId: 'conv-approval',
     };
@@ -1121,22 +1122,52 @@ describe('SDK session contract', () => {
     expect(getLatestRunError).toHaveBeenCalledWith('agent-contract-test', 'conv-approval');
   });
 
-  it('retries processMessage once after approval conflict even when orphan scan finds nothing', async () => {
+  it('does not retry sendToAgent when approval recovery fails', async () => {
+    const mockSession = {
+      initialize: vi.fn(async () => undefined),
+      send: vi.fn(async (_message: unknown) => undefined),
+      stream: vi.fn(() => {
+        return (async function* () {
+          yield { type: 'result', success: false, error: 'error', conversationId: 'conv-approval' };
+        })();
+      }),
+      close: vi.fn(() => undefined),
+      recoverPendingApprovals: vi.fn(async () => ({ recovered: false, unsupported: true, detail: 'mock' })),
+      agentId: 'agent-contract-test',
+      conversationId: 'conv-approval',
+    };
+
+    vi.mocked(resumeSession).mockReturnValue(mockSession as never);
+    vi.mocked(getLatestRunError).mockResolvedValueOnce({
+      message: 'Run run-stuck stuck waiting for tool approval (status=created)',
+      stopReason: 'requires_approval',
+      isApprovalError: true,
+    });
+    vi.mocked(recoverPendingApprovalsForAgent).mockResolvedValueOnce({
+      recovered: false,
+      details: 'No resolvable approvals',
+    });
+
     const bot = new LettaBot({
       workingDir: join(dataDir, 'working'),
       allowedTools: [],
     });
 
-    let runCall = 0;
+    await expect(bot.sendToAgent('trigger approval retry')).rejects.toThrow();
+    // Only one attempt — no retry since recovery failed
+    expect(mockSession.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retry processMessage after approval conflict when recovery fails', async () => {
+    const bot = new LettaBot({
+      workingDir: join(dataDir, 'working'),
+      allowedTools: [],
+    });
+
     (bot as any).sessionManager.runSession = vi.fn(async () => ({
       session: { abort: vi.fn(async () => undefined), recoverPendingApprovals: vi.fn(async () => ({ recovered: false, unsupported: true, detail: 'mock' })) },
       stream: async function* () {
-        if (runCall++ === 0) {
-          yield { type: 'result', success: false, error: 'error', conversationId: 'conv-approval' };
-          return;
-        }
-        yield { type: 'assistant', content: 'after retry' };
-        yield { type: 'result', success: true, result: 'after retry', conversationId: 'conv-approval' };
+        yield { type: 'result', success: false, error: 'error', conversationId: 'conv-approval' };
       },
     }));
 
@@ -1174,45 +1205,34 @@ describe('SDK session contract', () => {
 
     await (bot as any).processMessage(msg, adapter);
 
-    expect((bot as any).sessionManager.runSession).toHaveBeenCalledTimes(2);
+    // Only 1 call — no retry since recovery failed
+    expect((bot as any).sessionManager.runSession).toHaveBeenCalledTimes(1);
     expect(recoverOrphanedConversationApproval).toHaveBeenCalledWith(
       'agent-contract-test',
       'conv-approval',
       true
     );
-    const sentTexts = adapter.sendMessage.mock.calls.map((call) => {
-      const payload = call[0] as { text?: string };
-      return payload.text;
-    });
-    expect(sentTexts).toContain('after retry');
   });
 
-  it('filters pre-foreground errors so they do not trigger false approval recovery', async () => {
+  it('filters pre-foreground errors and does not retry when recovery fails', async () => {
     const bot = new LettaBot({
       workingDir: join(dataDir, 'working'),
       allowedTools: [],
     });
 
-    let runCall = 0;
     (bot as any).sessionManager.runSession = vi.fn(async () => ({
       session: { abort: vi.fn(async () => undefined), recoverPendingApprovals: vi.fn(async () => ({ recovered: false, unsupported: true, detail: 'mock' })) },
       stream: async function* () {
-        if (runCall++ === 0) {
-          // Pre-foreground error is filtered by the pipeline -- it never
-          // reaches processMessage, so lastErrorDetail stays null and
-          // isApprovalConflict cannot fire.
-          yield {
-            type: 'error',
-            runId: 'run-bg',
-            message: 'CONFLICT: Cannot send a new message: waiting for approval',
-            stopReason: 'error',
-          };
-          yield { type: 'result', success: false, error: 'error', conversationId: 'conv-approval', runIds: ['run-main'] };
-          return;
-        }
-        // Retry succeeds
-        yield { type: 'assistant', content: 'after retry' };
-        yield { type: 'result', success: true, result: 'after retry', conversationId: 'conv-approval', runIds: ['run-main-2'] };
+        // Pre-foreground error is filtered by the pipeline -- it never
+        // reaches processMessage, so lastErrorDetail stays null and
+        // isApprovalConflict cannot fire.
+        yield {
+          type: 'error',
+          runId: 'run-bg',
+          message: 'CONFLICT: Cannot send a new message: waiting for approval',
+          stopReason: 'error',
+        };
+        yield { type: 'result', success: false, error: 'error', conversationId: 'conv-approval', runIds: ['run-main'] };
       },
     }));
 
@@ -1247,19 +1267,13 @@ describe('SDK session contract', () => {
 
     // The pre-foreground error is filtered, so lastErrorDetail is null.
     // The result (success=false, nothing delivered) triggers shouldRetryForErrorResult,
-    // NOT isApprovalConflict. The retry goes through the error-result path with
-    // orphaned approval recovery, then retries and succeeds.
-    expect((bot as any).sessionManager.runSession).toHaveBeenCalledTimes(2);
+    // NOT isApprovalConflict. Recovery fails so no retry happens.
+    expect((bot as any).sessionManager.runSession).toHaveBeenCalledTimes(1);
     // Approval recovery should have been attempted via the error-result path
     expect(recoverOrphanedConversationApproval).toHaveBeenCalledWith(
       'agent-contract-test',
       'conv-approval',
     );
-    const sentTexts = adapter.sendMessage.mock.calls.map((call) => {
-      const payload = call[0] as { text?: string };
-      return payload.text;
-    });
-    expect(sentTexts).toContain('after retry');
   });
 
   it('uses agent-level recovery for default conversation alias on terminal approval conflict', async () => {

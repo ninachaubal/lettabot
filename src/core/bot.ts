@@ -16,7 +16,7 @@ import { formatApiErrorForUser } from './errors.js';
 import { formatToolCallDisplay, formatReasoningDisplay, formatQuestionsForChannel } from './display.js';
 import type { AgentSession } from './interfaces.js';
 import { Store } from './store.js';
-import { getPendingApprovals, rejectApproval, cancelRuns, cancelConversation, recoverOrphanedConversationApproval, getLatestRunError, getAgentModel, updateAgentModel, isRecoverableConversationId, recoverPendingApprovalsForAgent, createAndAttachBlock, agentHasBlock } from '../tools/letta-api.js';
+import { getPendingApprovals, rejectApproval, cancelRuns, cancelConversation, recoverOrphanedConversationApproval, getLatestRunError, getAgentModel, updateAgentModel, isRecoverableConversationId, recoverPendingApprovalsForAgent } from '../tools/letta-api.js';
 import { getAgentSkillExecutableDirs, isVoiceMemoConfigured } from '../skills/loader.js';
 import { formatMessageEnvelope, formatGroupBatchEnvelope, type SessionContextOptions } from './formatter.js';
 import type { GroupBatcher } from './group-batcher.js';
@@ -33,7 +33,6 @@ import { resolveEmoji } from './emoji.js';
 import { SessionManager } from './session-manager.js';
 import { createDisplayPipeline, type DisplayEvent, type CompleteEvent, type ErrorEvent } from './display-pipeline.js';
 import { TurnLogger, TurnAccumulator, generateTurnId, type TurnRecord } from './turn-logger.js';
-import { buildUserBlockLabel, loadUserBlockTemplate } from './memory.js';
 
 
 import { createLogger } from '../logger.js';
@@ -288,6 +287,12 @@ export class LettaBot implements AgentSession {
   private listeningGroupIds: Set<string> = new Set();
   private processing = false; // Global lock for shared mode
   private processingKeys: Set<string> = new Set(); // Per-key locks for per-channel mode
+
+  // Global concurrency limiter: caps the number of concurrent Letta agent runs
+  // across all conversation keys to avoid spiking Anthropic's input-token rate limit.
+  private readonly maxConcurrentRuns = 2;
+  private activeRunCount = 0;
+  private runWaiters: Array<() => void> = [];
   private cancelledKeys: Set<string> = new Set(); // Tracks keys where /cancel was issued
   private backgroundCancelledKeys: Set<string> = new Set(); // Tracks background runs cancelled by live user activity
   private activeBackgroundTriggerByKey: Map<string, string> = new Map();
@@ -296,9 +301,6 @@ export class LettaBot implements AgentSession {
   // SDK surfaces non-empty result run_ids. Until then, this map mostly stays
   // empty and the streamed/result divergence guard remains the active defense.
   private lastResultRunFingerprints: Map<string, string> = new Map();
-
-  // Per-user memory block tracking: block labels we've already verified/created
-  private knownUserBlocks = new Set<string>();
 
   // AskUserQuestion support: resolves when the next user message arrives.
   // In per-chat mode, keyed by convKey so each chat resolves independently.
@@ -1263,45 +1265,6 @@ export class LettaBot implements AgentSession {
   }
 
   // =========================================================================
-  // Per-user memory block registration
-  // =========================================================================
-
-  /**
-   * Ensure that the Letta agent has a dedicated memory block for this user.
-   * Uses an in-memory cache to avoid redundant API calls after the first check.
-   */
-  private async ensureUserMemoryBlock(msg: InboundMessage): Promise<void> {
-    const label = buildUserBlockLabel(msg.channel, msg.userId);
-
-    // Fast path: already known
-    if (this.knownUserBlocks.has(label)) return;
-
-    const agentId = this.store.agentId;
-    if (!agentId) return;
-
-    // Check if block already exists on the agent
-    if (await agentHasBlock(agentId, label)) {
-      this.knownUserBlocks.add(label);
-      return;
-    }
-
-    // Create new block from template
-    const template = loadUserBlockTemplate(this.config.agentName);
-    const blockId = await createAndAttachBlock(
-      agentId,
-      label,
-      template.value,
-      template.description,
-      template.limit,
-    );
-
-    if (blockId) {
-      this.knownUserBlocks.add(label);
-      log.info(`Created memory block for new user: ${label}`);
-    }
-  }
-
-  // =========================================================================
   // processMessage - User-facing message handling
   // =========================================================================
 
@@ -1313,11 +1276,6 @@ export class LettaBot implements AgentSession {
       log.debug(`${label}: ${(performance.now() - t0).toFixed(0)}ms`);
     };
 
-    // Ensure per-user memory block exists (fire-and-forget; errors are logged inside)
-    this.ensureUserMemoryBlock(msg).catch((err) => {
-      log.warn(`Failed to ensure user memory block: ${err}`);
-    });
-
     const suppressDelivery = isResponseDeliverySuppressed(msg);
     const prepared = await this.prepareMessageForRun(msg, adapter, suppressDelivery, lap);
     if (!prepared) {
@@ -1325,7 +1283,8 @@ export class LettaBot implements AgentSession {
     }
     const { messageToSend, canUseTool } = prepared;
 
-    // Run session
+    // Run session (gated by global concurrency limiter)
+    await this.acquireRunSlot();
     let session: Session | null = null;
     try {
       const convKey = this.resolveConversationKey(msg.channel, msg.chatId, msg.forcePerChat);
@@ -1687,9 +1646,9 @@ export class LettaBot implements AgentSession {
                 event.raw, resultText, hasResponse, sentAnyMessage, lastErrorDetail,
               );
 
-              // Approval conflict recovery
+              // Approval conflict recovery (single attempt only)
               if (retryDecision.isApprovalConflict && !retried && this.store.agentId) {
-                log.info('Approval conflict detected -- attempting SDK recovery...');
+                log.info('Approval conflict detected -- attempting recovery (1 attempt)...');
                 clearInterval(typingInterval);
 
                 // Try SDK-level recovery first (through CLI control protocol)
@@ -1712,13 +1671,12 @@ export class LettaBot implements AgentSession {
                   : await recoverPendingApprovalsForAgent(this.store.agentId);
                 if (result.recovered) {
                   log.info(`API-level recovery succeeded (${result.details}), retrying message...`);
-                } else {
-                  log.warn(`API-level recovery failed: ${result.details}`);
+                  return this.processMessage(msg, adapter, true);
                 }
-                return this.processMessage(msg, adapter, true);
+                log.warn(`API-level recovery failed: ${result.details} -- not retrying`);
               }
 
-              // Empty/error result retry
+              // Empty/error result retry (single attempt only)
               if (retryDecision.shouldRetryForEmptyResult || retryDecision.shouldRetryForErrorResult) {
                 if (!retried && this.store.agentId && retryConvId) {
                   const reason = retryDecision.shouldRetryForErrorResult ? 'error result' : 'empty result';
@@ -1731,10 +1689,7 @@ export class LettaBot implements AgentSession {
                     log.info(`Recovery succeeded (${convResult.details}), retrying message...`);
                     return this.processMessage(msg, adapter, true);
                   }
-                  if (retryDecision.shouldRetryForErrorResult) {
-                    log.info('Retrying once after terminal error...');
-                    return this.processMessage(msg, adapter, true);
-                  }
+                  log.warn(`Recovery failed (${convResult.details}) -- not retrying`);
                 }
               }
 
@@ -1889,6 +1844,7 @@ export class LettaBot implements AgentSession {
         log.error('Failed to send error message to channel:', sendError);
       }
     } finally {
+      this.releaseRunSlot();
       const finalConvKey = this.resolveConversationKey(msg.channel, msg.chatId, msg.forcePerChat);
       // When session reuse is disabled, invalidate after every message to
       // eliminate any possibility of stream state bleed between sequential
@@ -1904,6 +1860,24 @@ export class LettaBot implements AgentSession {
   // sendToAgent - Background triggers (heartbeats, cron, webhooks)
   // =========================================================================
   
+  /**
+   * Wait until a global run slot is available, then claim it.
+   * This caps the number of concurrent Letta agent runs to avoid spiking
+   * Anthropic's uncached input-token rate limit.
+   */
+  private async acquireRunSlot(): Promise<void> {
+    while (this.activeRunCount >= this.maxConcurrentRuns) {
+      await new Promise<void>(resolve => this.runWaiters.push(resolve));
+    }
+    this.activeRunCount++;
+  }
+
+  private releaseRunSlot(): void {
+    this.activeRunCount--;
+    const next = this.runWaiters.shift();
+    if (next) next();
+  }
+
   /**
    * Acquire the appropriate lock for a conversation key.
    * In per-channel mode, wait for that key's queue to drain before proceeding.
@@ -1953,8 +1927,9 @@ export class LettaBot implements AgentSession {
     const convKey = this.resolveHeartbeatConversationKey();
     const triggerType = context?.type ?? 'heartbeat';
     const acquired = await this.acquireLock(convKey);
+    await this.acquireRunSlot();
     this.activeBackgroundTriggerByKey.set(convKey, triggerType);
-    
+
     const sendT0 = performance.now();
     const sendTurnId = this.turnLogger ? generateTurnId() : '';
     const sendTurnAcc = this.turnLogger ? new TurnAccumulator() : null;
@@ -2038,25 +2013,31 @@ export class LettaBot implements AgentSession {
                   || ((lastErrorDetail?.message?.toLowerCase().includes('conflict') || false)
                   && (lastErrorDetail?.message?.toLowerCase().includes('waiting for approval') || false));
                 if (isApprovalIssue && !retried) {
-                  log.info('sendToAgent: approval conflict detected -- attempting SDK recovery...');
+                  log.info('sendToAgent: approval conflict detected -- attempting recovery (1 attempt)...');
+                  let recovered = false;
                   const sdkResult = await recoverPendingApprovalsWithSdk(session, 10_000);
                   if (sdkResult.recovered) {
                     log.info('sendToAgent: SDK approval recovery succeeded');
+                    recovered = true;
                   } else {
                     log.warn(`sendToAgent: SDK recovery did not resolve (${sdkResult.detail ?? 'unknown'}), trying API-level recovery...`);
                     if (this.store.agentId) {
                       const recovery = await recoverPendingApprovalsForAgent(this.store.agentId);
                       if (recovery.recovered) {
                         log.info(`sendToAgent: API-level recovery succeeded (${recovery.details})`);
+                        recovered = true;
                       } else {
                         log.warn(`sendToAgent: API-level recovery failed (${recovery.details})`);
                       }
                     }
                   }
-                  this.sessionManager.invalidateSession(convKey);
-                  retried = true;
-                  approvalRetryPending = true;
-                  break;
+                  if (recovered) {
+                    this.sessionManager.invalidateSession(convKey);
+                    retried = true;
+                    approvalRetryPending = true;
+                    break;
+                  }
+                  log.warn('sendToAgent: approval recovery failed -- not retrying');
                 }
                 const errMsg = lastErrorDetail?.message || msg.error || 'error';
                 const errReason = lastErrorDetail?.stopReason || msg.error || 'error';
@@ -2160,6 +2141,7 @@ export class LettaBot implements AgentSession {
           durationMs: Math.round(performance.now() - sendT0),
         }).catch(() => {});
       }
+      this.releaseRunSlot();
       this.releaseLock(convKey, acquired);
     }
   }
@@ -2174,6 +2156,7 @@ export class LettaBot implements AgentSession {
   ): AsyncGenerator<StreamMsg> {
     const convKey = this.resolveHeartbeatConversationKey();
     const acquired = await this.acquireLock(convKey);
+    await this.acquireRunSlot();
     const streamT0 = performance.now();
     const streamTurnId = this.turnLogger ? generateTurnId() : '';
     const streamTurnAcc = this.turnLogger ? new TurnAccumulator() : null;
@@ -2210,6 +2193,7 @@ export class LettaBot implements AgentSession {
           error: streamTurnError,
         }).catch(() => {});
       }
+      this.releaseRunSlot();
       this.releaseLock(convKey, acquired);
     }
   }

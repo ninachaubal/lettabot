@@ -8,9 +8,6 @@ const mockRunsList = vi.fn();
 const mockAgentsMessagesCancel = vi.fn();
 const mockAgentsRetrieve = vi.fn();
 const mockAgentsMessagesList = vi.fn();
-const mockBlocksCreate = vi.fn();
-const mockAgentsBlocksList = vi.fn();
-const mockAgentsBlocksAttach = vi.fn();
 
 vi.mock('@letta-ai/letta-client', () => {
   return {
@@ -25,18 +22,11 @@ vi.mock('@letta-ai/letta-client', () => {
         retrieve: mockRunsRetrieve,
         list: mockRunsList,
       };
-      blocks = {
-        create: mockBlocksCreate,
-      };
       agents = {
         retrieve: mockAgentsRetrieve,
         messages: {
           cancel: mockAgentsMessagesCancel,
           list: mockAgentsMessagesList,
-        },
-        blocks: {
-          list: mockAgentsBlocksList,
-          attach: mockAgentsBlocksAttach,
         },
       };
     },
@@ -84,7 +74,7 @@ describe('recoverPendingApprovalsForAgent', () => {
   });
 });
 
-import { getLatestRunError, recoverOrphanedConversationApproval, isRecoverableConversationId, recoverPendingApprovalsForAgent, createAndAttachBlock, getAgentMemoryBlocks, agentHasBlock } from './letta-api.js';
+import { getLatestRunError, recoverOrphanedConversationApproval, isRecoverableConversationId, recoverPendingApprovalsForAgent } from './letta-api.js';
 
 describe('isRecoverableConversationId', () => {
   it('returns false for aliases and empty values', () => {
@@ -463,156 +453,3 @@ describe('getLatestRunError', () => {
   });
 });
 
-// ============================================================================
-// Memory Block Management
-// ============================================================================
-
-describe('createAndAttachBlock', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  it('creates a block and attaches it to the agent, returning the block id', async () => {
-    mockBlocksCreate.mockResolvedValue({ id: 'block-123' });
-    mockAgentsBlocksAttach.mockResolvedValue({});
-
-    const result = await createAndAttachBlock('agent-1', 'user_nina', 'Nina is a software engineer.');
-
-    expect(result).toBe('block-123');
-    expect(mockBlocksCreate).toHaveBeenCalledWith({
-      label: 'user_nina',
-      value: 'Nina is a software engineer.',
-      description: undefined,
-      limit: undefined,
-    });
-    expect(mockAgentsBlocksAttach).toHaveBeenCalledWith('block-123', { agent_id: 'agent-1' });
-  });
-
-  it('passes optional description and limit to blocks.create', async () => {
-    mockBlocksCreate.mockResolvedValue({ id: 'block-456' });
-    mockAgentsBlocksAttach.mockResolvedValue({});
-
-    const result = await createAndAttachBlock(
-      'agent-2',
-      'user_bob',
-      'Bob likes hiking.',
-      'Memory block for user Bob',
-      5000,
-    );
-
-    expect(result).toBe('block-456');
-    expect(mockBlocksCreate).toHaveBeenCalledWith({
-      label: 'user_bob',
-      value: 'Bob likes hiking.',
-      description: 'Memory block for user Bob',
-      limit: 5000,
-    });
-    expect(mockAgentsBlocksAttach).toHaveBeenCalledWith('block-456', { agent_id: 'agent-2' });
-  });
-
-  it('returns null when blocks.create throws', async () => {
-    mockBlocksCreate.mockRejectedValue(new Error('API error'));
-
-    const result = await createAndAttachBlock('agent-1', 'user_nina', 'some value');
-
-    expect(result).toBeNull();
-    expect(mockAgentsBlocksAttach).not.toHaveBeenCalled();
-  });
-
-  it('returns null when agents.blocks.attach throws', async () => {
-    mockBlocksCreate.mockResolvedValue({ id: 'block-789' });
-    mockAgentsBlocksAttach.mockRejectedValue(new Error('Attach failed'));
-
-    const result = await createAndAttachBlock('agent-1', 'user_nina', 'some value');
-
-    expect(result).toBeNull();
-  });
-});
-
-describe('getAgentMemoryBlocks', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  it('returns all blocks for an agent', async () => {
-    const blocks = [
-      { id: 'block-1', label: 'human', value: 'Human info' },
-      { id: 'block-2', label: 'persona', value: 'Persona info' },
-      { id: 'block-3', label: 'user_nina', value: 'Nina info' },
-    ];
-    mockAgentsBlocksList.mockReturnValue(mockPageIterator(blocks));
-
-    const result = await getAgentMemoryBlocks('agent-1');
-
-    expect(result).toHaveLength(3);
-    expect(result[0]).toEqual({ id: 'block-1', label: 'human', value: 'Human info' });
-    expect(result[2]).toEqual({ id: 'block-3', label: 'user_nina', value: 'Nina info' });
-    expect(mockAgentsBlocksList).toHaveBeenCalledWith('agent-1');
-  });
-
-  it('returns empty array when no blocks exist', async () => {
-    mockAgentsBlocksList.mockReturnValue(mockPageIterator([]));
-
-    const result = await getAgentMemoryBlocks('agent-1');
-
-    expect(result).toEqual([]);
-  });
-
-  it('returns empty array on error', async () => {
-    mockAgentsBlocksList.mockImplementation(() => {
-      throw new Error('API error');
-    });
-
-    const result = await getAgentMemoryBlocks('agent-1');
-
-    expect(result).toEqual([]);
-  });
-});
-
-describe('agentHasBlock', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  it('returns true when agent has a block with the given label', async () => {
-    const blocks = [
-      { id: 'block-1', label: 'human', value: 'Human info' },
-      { id: 'block-2', label: 'user_nina', value: 'Nina info' },
-    ];
-    mockAgentsBlocksList.mockReturnValue(mockPageIterator(blocks));
-
-    const result = await agentHasBlock('agent-1', 'user_nina');
-
-    expect(result).toBe(true);
-  });
-
-  it('returns false when agent does not have a block with the given label', async () => {
-    const blocks = [
-      { id: 'block-1', label: 'human', value: 'Human info' },
-      { id: 'block-2', label: 'persona', value: 'Persona info' },
-    ];
-    mockAgentsBlocksList.mockReturnValue(mockPageIterator(blocks));
-
-    const result = await agentHasBlock('agent-1', 'user_bob');
-
-    expect(result).toBe(false);
-  });
-
-  it('returns false when agent has no blocks', async () => {
-    mockAgentsBlocksList.mockReturnValue(mockPageIterator([]));
-
-    const result = await agentHasBlock('agent-1', 'user_nina');
-
-    expect(result).toBe(false);
-  });
-
-  it('returns false on error', async () => {
-    mockAgentsBlocksList.mockImplementation(() => {
-      throw new Error('API error');
-    });
-
-    const result = await agentHasBlock('agent-1', 'user_nina');
-
-    expect(result).toBe(false);
-  });
-});
