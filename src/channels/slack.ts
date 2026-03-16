@@ -428,7 +428,8 @@ export class SlackAdapter implements ChannelAdapter {
       this.userProfileCache.set(userId, displayName);
       return displayName;
     } catch (error) {
-      log.warn(`Failed to resolve user profile for ${userId}:`, error);
+      const slackError = (error as any)?.data?.error || (error as Error)?.message || error;
+      log.warn(`Failed to resolve user profile for ${userId}: ${slackError} (ensure bot has users:read scope)`);
       this.userProfileCache.set(userId, userId);
       return userId;
     }
