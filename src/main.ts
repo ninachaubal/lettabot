@@ -6,7 +6,16 @@
  */
 
 import { existsSync, mkdirSync, promises as fs } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join, resolve, delimiter } from 'node:path';
+
+// Ensure package bin scripts (lettabot-schedule, lettabot-message, etc.)
+// are on PATH so the Letta Code subprocess can invoke them via Bash.
+// When started with `node dist/main.js` (e.g. Railway), node_modules/.bin
+// is not automatically on PATH.
+const binDir = resolve('node_modules', '.bin');
+if (existsSync(binDir) && !process.env.PATH?.split(delimiter).includes(binDir)) {
+  process.env.PATH = `${binDir}${delimiter}${process.env.PATH || ''}`;
+}
 
 // API server imports
 import { createApiServer } from './api/server.js';
