@@ -6,15 +6,22 @@
  */
 
 import { existsSync, mkdirSync, promises as fs } from 'node:fs';
-import { join, resolve, delimiter } from 'node:path';
+import { join, resolve, dirname, delimiter } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // Ensure package bin scripts (lettabot-schedule, lettabot-message, etc.)
 // are on PATH so the Letta Code subprocess can invoke them via Bash.
 // When started with `node dist/main.js` (e.g. Railway), node_modules/.bin
-// is not automatically on PATH.
-const binDir = resolve('node_modules', '.bin');
+// is not automatically on PATH. Use import.meta.url to resolve from the
+// source file location rather than relying on process.cwd().
+const __mainDir = dirname(fileURLToPath(import.meta.url));
+const projectRoot = resolve(__mainDir, '..');
+const binDir = join(projectRoot, 'node_modules', '.bin');
 if (existsSync(binDir) && !process.env.PATH?.split(delimiter).includes(binDir)) {
   process.env.PATH = `${binDir}${delimiter}${process.env.PATH || ''}`;
+  console.log(`[PATH] Prepended ${binDir} to PATH`);
+} else if (!existsSync(binDir)) {
+  console.warn(`[PATH] node_modules/.bin not found at ${binDir}`);
 }
 
 // API server imports
