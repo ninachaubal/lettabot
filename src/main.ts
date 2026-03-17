@@ -5,23 +5,38 @@
  * Chat continues seamlessly between Telegram, Slack, and WhatsApp.
  */
 
-import { existsSync, mkdirSync, promises as fs } from 'node:fs';
+import { existsSync, mkdirSync, symlinkSync, readFileSync, promises as fs } from 'node:fs';
 import { join, resolve, dirname, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // Ensure package bin scripts (lettabot-schedule, lettabot-message, etc.)
-// are on PATH so the Letta Code subprocess can invoke them via Bash.
-// When started with `node dist/main.js` (e.g. Railway), node_modules/.bin
-// is not automatically on PATH. Use import.meta.url to resolve from the
-// source file location rather than relying on process.cwd().
+// are available to the Letta Code subprocess.
+// Strategy: symlink our bin entries into /usr/local/bin (already on PATH).
+// This handles Nixpacks where node_modules/.bin symlinks may not exist.
 const __mainDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(__mainDir, '..');
+try {
+  const pkg = JSON.parse(readFileSync(join(projectRoot, 'package.json'), 'utf-8'));
+  const bins: Record<string, string> = pkg.bin || {};
+  for (const [name, relPath] of Object.entries(bins)) {
+    const target = resolve(projectRoot, relPath);
+    const link = join('/usr/local/bin', name);
+    if (existsSync(target) && !existsSync(link)) {
+      try {
+        symlinkSync(target, link);
+        console.log(`[bin] Linked ${name} → ${target}`);
+      } catch {
+        // May lack permissions (non-root) — fall back to PATH prepend
+      }
+    }
+  }
+} catch {
+  // package.json read failed — skip
+}
+// Fallback: also prepend node_modules/.bin to PATH
 const binDir = join(projectRoot, 'node_modules', '.bin');
 if (existsSync(binDir) && !process.env.PATH?.split(delimiter).includes(binDir)) {
   process.env.PATH = `${binDir}${delimiter}${process.env.PATH || ''}`;
-  console.log(`[PATH] Prepended ${binDir} to PATH`);
-} else if (!existsSync(binDir)) {
-  console.warn(`[PATH] node_modules/.bin not found at ${binDir}`);
 }
 
 // API server imports
